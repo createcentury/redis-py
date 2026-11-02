@@ -3259,28 +3259,29 @@ class ConnectionPool(
 
     async def release(self, connection: AbstractConnection):
         """Releases the connection back to the pool"""
+        locked = False
         try:
-            await self._lock.acquire()
+            async with self._lock:
+                locked = True
+                # Connections should always be returned to the correct pool,
+                # not doing so is an error that will cause an exception here.
+                self._in_use_connections.remove(connection)
+
+                if connection.should_reconnect():
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            "Disconnecting released connection marked for "
+                            f"reconnect: {connection}, "
+                            f"{connection.extract_connection_details()}"
+                        )
+                    await connection.disconnect()
+
+                self._available_connections.append(connection)
         except asyncio.CancelledError:
-            # Only a contended lock can suspend here; don't leak on cancel.
-            self._release_in_background(connection)
+            if not locked:
+                # Cancelled while waiting for a contended lock: don't leak.
+                self._release_in_background(connection)
             raise
-        try:
-            # Connections should always be returned to the correct pool,
-            # not doing so is an error that will cause an exception here.
-            self._in_use_connections.remove(connection)
-
-            if connection.should_reconnect():
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(
-                        "Disconnecting released connection marked for reconnect: "
-                        f"{connection}, {connection.extract_connection_details()}"
-                    )
-                await connection.disconnect()
-
-            self._available_connections.append(connection)
-        finally:
-            self._lock.release()
 
         await self._event_dispatcher.dispatch_async(
             AsyncAfterConnectionReleasedEvent(connection)
@@ -3564,13 +3565,13 @@ class BlockingConnectionPool(ConnectionPool):
 
     async def release(self, connection: AbstractConnection):
         """Releases the connection back to the pool."""
+        locked = False
         try:
-            await self._condition.acquire()
+            async with self._condition:
+                locked = True
+                await super().release(connection)
+                self._condition.notify()
         except asyncio.CancelledError:
-            self._release_in_background(connection)
+            if not locked:
+                self._release_in_background(connection)
             raise
-        try:
-            await super().release(connection)
-            self._condition.notify()
-        finally:
-            self._condition.release()
