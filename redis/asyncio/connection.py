@@ -3204,7 +3204,8 @@ class ConnectionPool(
 
             return connection
         except BaseException:
-            await self.release(connection)
+            # Shielded so that a repeated cancel cannot leak the connection.
+            await asyncio.shield(self.release(connection))
             raise
 
     def get_available_connection(self):
@@ -3535,7 +3536,8 @@ class BlockingConnectionPool(ConnectionPool):
 
             return connection
         except BaseException:
-            await self.release(connection)
+            # Shielded so that a repeated cancel cannot leak the connection.
+            await asyncio.shield(self.release(connection))
             raise
 
     async def release(self, connection: AbstractConnection):

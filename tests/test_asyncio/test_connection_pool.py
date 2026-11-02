@@ -680,6 +680,45 @@ class TestBlockingConnectionPool:
         assert "db=0" in repr_output
 
 
+class TestReleaseWhenCancelled:
+    """
+    get_connection() must return the connection even if cancelled again while
+    release() waits for the pool lock (held e.g. by a streaming-credentials
+    re-auth).
+    """
+
+    @staticmethod
+    async def _wait_until_released(pool, connection) -> None:
+        async with asyncio.timeout(2):
+            while connection in pool._in_use_connections:
+                await asyncio.sleep(0.01)
+        assert connection in pool._available_connections
+
+    @pytest.mark.parametrize("pool_class", [ConnectionPool, BlockingConnectionPool])
+    async def test_get_connection_releases_when_cancelled(self, pool_class):
+        pool = pool_class(connection_class=DummyConnection)
+        started = asyncio.Event()
+
+        async def hang(connection):
+            started.set()
+            await asyncio.Event().wait()
+
+        with patch.object(pool, "ensure_connection", side_effect=hang):
+            task = asyncio.ensure_future(pool.get_connection())
+            await started.wait()
+            (leased,) = pool._in_use_connections
+            await pool._lock.acquire()
+            try:
+                task.cancel()
+                await asyncio.sleep(0.01)
+                task.cancel()  # again, as a level-triggered scope would
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            finally:
+                pool._lock.release()
+        await self._wait_until_released(pool, leased)
+
+
 @pytest.mark.fixed_client
 class TestConnectionPoolURLParsing:
     def test_hostname(self):
