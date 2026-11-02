@@ -1252,6 +1252,13 @@ class PubSub:
         if not hasattr(self, "connection"):
             return
         async with self._lock:
+            # Cleared before the teardown awaits, so a cancel cannot keep them.
+            self.channels = {}
+            self.pending_unsubscribe_channels = set()
+            self.patterns = {}
+            self.pending_unsubscribe_patterns = set()
+            self.shard_channels = {}
+            self.pending_unsubscribe_shard_channels = set()
             if self.connection:
                 # Use nowait=True to avoid awaiting StreamWriter.wait_closed(),
                 # which can deadlock when a concurrent reader task (e.g. one
@@ -1263,12 +1270,6 @@ class PubSub:
                 # the pubsub never holds a connection that is back in the pool.
                 connection, self.connection = self.connection, None
                 await self.connection_pool.release(connection)
-            self.channels = {}
-            self.pending_unsubscribe_channels = set()
-            self.patterns = {}
-            self.pending_unsubscribe_patterns = set()
-            self.shard_channels = {}
-            self.pending_unsubscribe_shard_channels = set()
 
     @deprecated_function(version="5.0.1", reason="Use aclose() instead", name="close")
     async def close(self) -> None:

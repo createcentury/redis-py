@@ -682,7 +682,7 @@ class TestBlockingConnectionPool:
 
 class TestReleaseWhenCancelled:
     """
-    get_connection() must return the connection even if cancelled again while
+    A connection must go back to the pool even if the caller is cancelled while
     release() waits for the pool lock (held e.g. by a streaming-credentials
     re-auth).
     """
@@ -694,6 +694,18 @@ class TestReleaseWhenCancelled:
                 await asyncio.sleep(0.01)
         assert connection in pool._available_connections
 
+    @staticmethod
+    def _signal_release(pool):
+        """Patch pool.release to set an event once it has been entered."""
+        entered = asyncio.Event()
+        release = pool.release
+
+        async def signalling_release(connection):
+            entered.set()
+            return await release(connection)
+
+        return entered, patch.object(pool, "release", side_effect=signalling_release)
+
     @pytest.mark.parametrize("pool_class", [ConnectionPool, BlockingConnectionPool])
     async def test_get_connection_releases_when_cancelled(self, pool_class):
         pool = pool_class(connection_class=DummyConnection)
@@ -703,14 +715,15 @@ class TestReleaseWhenCancelled:
             started.set()
             await asyncio.Event().wait()
 
-        with patch.object(pool, "ensure_connection", side_effect=hang):
+        entered, signal_release = self._signal_release(pool)
+        with patch.object(pool, "ensure_connection", side_effect=hang), signal_release:
             task = asyncio.ensure_future(pool.get_connection())
             await started.wait()
             (leased,) = pool._in_use_connections
             await pool._lock.acquire()
             try:
                 task.cancel()
-                await asyncio.sleep(0.01)
+                await entered.wait()  # the cleanup release() waits for the lock
                 task.cancel()  # again, as a level-triggered scope would
                 with pytest.raises(asyncio.CancelledError):
                     await task
@@ -742,18 +755,22 @@ class TestReleaseWhenCancelled:
         p = r.pubsub()
         await p.subscribe("foo")
         leased = p.connection
+        entered, signal_release = self._signal_release(pool)
         await pool._lock.acquire()
         try:
-            task = asyncio.ensure_future(p.aclose())
-            await asyncio.sleep(0.01)  # now waiting for the pool lock
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+            with signal_release:
+                task = asyncio.ensure_future(p.aclose())
+                await entered.wait()  # release() now waits for the pool lock
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
         finally:
             pool._lock.release()
         await self._wait_until_released(pool, leased)
-        # The pubsub must not keep a connection the pool can lend out again.
+        # The pubsub must not keep a connection the pool can lend out again,
+        # nor subscriptions that a later connect() would replay.
         assert p.connection is None
+        assert not p.subscribed
 
     @pytest.mark.onlynoncluster
     async def test_execute_command_releases_when_cancelled(self, r):
@@ -769,14 +786,18 @@ class TestReleaseWhenCancelled:
             await resume.wait()
             return await send_and_parse(*args, **kwargs)
 
-        with patch.object(r, "_send_command_parse_response", side_effect=slow):
+        entered, signal_release = self._signal_release(pool)
+        with (
+            patch.object(r, "_send_command_parse_response", side_effect=slow),
+            signal_release,
+        ):
             task = asyncio.ensure_future(r.ping())
             await started.wait()
             (leased,) = pool._in_use_connections
             await pool._lock.acquire()
             try:
                 resume.set()
-                await asyncio.sleep(0.01)  # now waiting for the pool lock
+                await entered.wait()  # release() now waits for the pool lock
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await task
