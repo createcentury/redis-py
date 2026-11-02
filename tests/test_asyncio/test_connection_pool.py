@@ -718,6 +718,53 @@ class TestReleaseWhenCancelled:
                 pool._lock.release()
         await self._wait_until_released(pool, leased)
 
+    async def test_background_release_failure_is_logged(self, caplog):
+        pool = ConnectionPool(connection_class=DummyConnection)
+        connection = await pool.get_connection()
+        await pool._lock.acquire()
+        task = asyncio.ensure_future(pool.release(connection))
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        with patch.object(
+            pool._event_dispatcher, "dispatch_async", side_effect=RuntimeError("x")
+        ):
+            pool._lock.release()
+            await self._wait_until_released(pool, connection)
+            await asyncio.sleep(0.01)  # let the done callback run
+        assert not pool._background_releases
+        assert "Failed to release a connection after a cancellation" in caplog.text
+
+    @pytest.mark.onlynoncluster
+    async def test_execute_command_releases_when_cancelled(self, r):
+        if r.single_connection_client:
+            pytest.skip("single-connection clients do not release per command")
+        pool = r.connection_pool
+        started = asyncio.Event()
+        resume = asyncio.Event()
+        send_and_parse = r._send_command_parse_response
+
+        async def slow(*args, **kwargs):
+            started.set()
+            await resume.wait()
+            return await send_and_parse(*args, **kwargs)
+
+        with patch.object(r, "_send_command_parse_response", side_effect=slow):
+            task = asyncio.ensure_future(r.ping())
+            await started.wait()
+            (leased,) = pool._in_use_connections
+            await pool._lock.acquire()
+            try:
+                resume.set()
+                await asyncio.sleep(0.01)  # now waiting for the pool lock
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            finally:
+                pool._lock.release()
+        await self._wait_until_released(pool, leased)
+
 
 @pytest.mark.fixed_client
 class TestConnectionPoolURLParsing:
