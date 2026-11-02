@@ -737,6 +737,25 @@ class TestReleaseWhenCancelled:
         assert "Failed to release a connection after a cancellation" in caplog.text
 
     @pytest.mark.onlynoncluster
+    async def test_pubsub_aclose_detaches_when_release_cancelled(self, r):
+        pool = r.connection_pool
+        p = r.pubsub()
+        await p.subscribe("foo")
+        leased = p.connection
+        await pool._lock.acquire()
+        try:
+            task = asyncio.ensure_future(p.aclose())
+            await asyncio.sleep(0.01)  # now waiting for the pool lock
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            pool._lock.release()
+        await self._wait_until_released(pool, leased)
+        # The pubsub must not keep a connection the pool can lend out again.
+        assert p.connection is None
+
+    @pytest.mark.onlynoncluster
     async def test_execute_command_releases_when_cancelled(self, r):
         if r.single_connection_client:
             pytest.skip("single-connection clients do not release per command")
